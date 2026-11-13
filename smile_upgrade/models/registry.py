@@ -14,6 +14,14 @@ _logger = logging.getLogger(__name__)
 
 native_new = Registry.new
 
+# Databases whose upgrade pass is running in this process. Once it has
+# uninstalled the modules marked 'to remove', load_modules() reloads the
+# registry recursively (loading.py, STEP 5), still under preload_registries.
+# That nested call must go straight to Odoo: a second UpgradeManager would
+# open another connection and wait forever on the advisory lock the first one
+# holds.
+_upgrading_dbs = set()
+
 
 @classmethod
 def new(
@@ -28,7 +36,10 @@ def new(
     models_to_check: set[str] | None = None,
 ):
     callers = [frame[3] for frame in inspect.stack()]
-    if "preload_registries" not in callers and "_initialize_db" not in callers:
+    preloading = (
+        "preload_registries" in callers or "_initialize_db" in callers
+    )
+    if db_name in _upgrading_dbs or not preloading:
         return native_new(
             db_name=db_name,
             update_module=update_module,
@@ -51,21 +62,25 @@ def new(
                     _logger.info("loading %s upgrade...", upgrade_manager.code_version)
                     max_cron_threads = _get_initial_config()
                     to_install, to_upgrade = _run_upgrade_pre(upgrade_manager)
-                    native_new(
-                        db_name=db_name,
-                        # Forced: Odoo only installs/upgrades modules when this flag
-                        # is set, and preload_registries() computes it from
-                        # `config['init'] or config['update']` — empty when the
-                        # upgrade is triggered by upgrades_path alone. Passing the
-                        # caller's value here would load the modules without ever
-                        # upgrading them, leaving them in state 'to upgrade'.
-                        update_module=True,
-                        install_modules=[*install_modules, *to_install],
-                        upgrade_modules=[*upgrade_modules, *to_upgrade],
-                        reinit_modules=reinit_modules,
-                        new_db_demo=new_db_demo,
-                        models_to_check=models_to_check,
-                    )
+                    _upgrading_dbs.add(db_name)
+                    try:
+                        native_new(
+                            db_name=db_name,
+                            # Forced: Odoo only installs/upgrades modules when this flag
+                            # is set, and preload_registries() computes it from
+                            # `config['init'] or config['update']` — empty when the
+                            # upgrade is triggered by upgrades_path alone. Passing the
+                            # caller's value here would load the modules without ever
+                            # upgrading them, leaving them in state 'to upgrade'.
+                            update_module=True,
+                            install_modules=[*install_modules, *to_install],
+                            upgrade_modules=[*upgrade_modules, *to_upgrade],
+                            reinit_modules=reinit_modules,
+                            new_db_demo=new_db_demo,
+                            models_to_check=models_to_check,
+                        )
+                    finally:
+                        _upgrading_dbs.discard(db_name)
                     _run_upgrade_post(upgrade_manager, max_cron_threads)
                     _logger.info(
                         "%s upgrade successfully loaded in %ss", upgrade_manager.code_version, time.time() - t0

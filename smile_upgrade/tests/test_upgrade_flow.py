@@ -175,6 +175,59 @@ class TestUpgradeFlow(TransactionCase):
         self.assertEqual(sorted(upgrade_call["upgrade_modules"]), ["base", "bobbies_stock"])
         self.assertEqual(list(final_call["upgrade_modules"]), ["bobbies_stock"])
 
+    def test_registry_reload_during_the_upgrade_is_a_plain_load(self):
+        """loading.py reloads the registry recursively (Registry.new) once it
+        has uninstalled the modules marked 'to remove' (STEP 5), still under
+        preload_registries. That nested call must not open a second
+        UpgradeManager: its advisory lock, held by the first one on another
+        connection, is never granted and the upgrade waits forever (2.0.43,
+        2026-11-13)."""
+        manager = StubUpgradeManager()
+        manager.cr = self.env.cr
+        managers_opened = []
+        native_calls = []
+
+        def open_manager(db_name):
+            managers_opened.append(db_name)
+            if len(managers_opened) > 1:
+                raise AssertionError(
+                    "second UpgradeManager: waits forever on its lock"
+                )
+            return manager
+
+        def fake_native_new(**call_kwargs):
+            native_calls.append(call_kwargs)
+            if len(native_calls) == 1:
+                # The upgrade pass: what load_modules() does after STEP 5.
+                smile_registry.new.__func__(
+                    Registry,
+                    "test_upgrade_flow",
+                    update_module=True,
+                    models_to_check=None,
+                )
+            return "<registry>"
+
+        def preload_registries():
+            return smile_registry.new.__func__(
+                Registry, "test_upgrade_flow", update_module=False
+            )
+
+        with (
+            patch.object(smile_registry, "native_new", fake_native_new),
+            patch.object(smile_registry, "UpgradeManager", open_manager),
+        ):
+            self.assertEqual(preload_registries(), "<registry>")
+
+        self.assertEqual(managers_opened, ["test_upgrade_flow"])
+        upgrade_call, reload_call, final_call = native_calls
+        self.assertEqual(list(upgrade_call["upgrade_modules"]), ["base"])
+        # The nested reload reaches Odoo with its own arguments, untouched.
+        self.assertIs(reload_call["update_module"], True)
+        self.assertEqual(list(reload_call["upgrade_modules"]), [])
+        self.assertEqual(manager.calls.count("pre_load"), 1)
+        self.assertEqual(manager.calls.count("set_db_version"), 1)
+        self.assertFalse(final_call["update_module"])
+
     def test_no_upgrade_to_load_is_a_plain_registry_load(self):
         manager = StubUpgradeManager()
         manager.upgrades = []

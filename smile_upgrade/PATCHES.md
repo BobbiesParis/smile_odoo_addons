@@ -103,13 +103,38 @@ entered the module graph, read from the **manifests on disk** (the
 `ir_module_module_dependency` table is only refreshed by `update_list()`, so it is
 stale on a load-only run).
 
+## 6. An upgrade that uninstalls a module waits forever on its own lock
+
+**File** `models/registry.py` — `new()`, `_upgrading_dbs`
+
+**Symptom** — `Reloading registry once more after uninstalling modules`, then
+`Locking upgrade... / Waiting for unlock...` every 5 s, forever (production 2.0.43,
+2026-11-13: the `bobbies_mcp` migration marked the MuK modules `to remove`).
+
+**Cause** — once it has uninstalled the modules marked `to remove`, `load_modules()`
+commits and calls `Registry.new()` recursively (`loading.py`, STEP 5). The call stack
+still holds `preload_registries`, so the patched `new()` takes the upgrade path again
+and opens a second `UpgradeManager` on another connection. Its
+`pg_try_advisory_lock(5665)` is never granted: the first `UpgradeManager`, which only
+releases the lock once that nested call returns, holds it. Session advisory locks are
+re-entrant only within the same session.
+
+**Change** — the upgrade pass registers its database in `_upgrading_dbs` around its
+`native_new()` call; a `new()` for a database in that set goes straight to Odoo, with
+its own arguments, as a vanilla server would.
+
+**Verified** — on a copy of the local database with `code.version` lowered and a leaf
+module marked `to remove`: without the patch the boot loops on `Waiting for unlock...`
+right after the reload; with it the upgrade completes, the module is `uninstalled` and
+`code.version` is set (`test_registry_reload_during_the_upgrade_is_a_plain_load`).
+
 ---
 
 ## Maintenance
 
 - Tests: `smile_upgrade/tests/` (tagged `continuous_integration`). Run them with
   `--test-tags /smile_upgrade`.
-- After pulling a new vendor version, re-apply these five patches and re-run the tests;
+- After pulling a new vendor version, re-apply these six patches and re-run the tests;
   patches 1 to 3 are pure bug fixes and should be dropped as soon as they land upstream.
 - Bobbies-side consumers to keep in mind: `bobbies_infra` depends on this module,
   `upgrades/2.0.0/__upgrade__.py` uses `modules_to_install`, and
