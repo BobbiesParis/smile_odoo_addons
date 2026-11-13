@@ -30,6 +30,11 @@ class UpgradeManager:
         self.force_reload = self._get_force_reload_param()
         self.upgrades = self._get_upgrades()
         self.modules_to_upgrade = list(set(sum([upgrade.modules_to_upgrade for upgrade in self.upgrades], [])))
+        # Modules an upgrade introduces as new dependencies of already installed
+        # modules. button_upgrade() cannot discover them: it only scans modules in
+        # state 'installed', so a module left in 'to upgrade' by a previous run (or
+        # by the editor's upgrade) never gets its new dependencies installed.
+        self.modules_to_install = list(set(sum([upgrade.modules_to_install for upgrade in self.upgrades], [])))
         self.modules_to_install_at_creation = (self.upgrades and self.upgrades[-1].modules_to_install_at_creation) or []
 
     def __enter__(self):
@@ -208,6 +213,7 @@ class Upgrade:
             "databases": [],
             "translations_to_reload": [],
             "modules_to_upgrade": [],
+            "modules_to_install": [],
             "modules_to_install_at_creation": [],
             "pre-load": [],
             "post-load": [],
